@@ -1,98 +1,58 @@
-import chalk from 'chalk';
 import Redis from 'ioredis';
 
 export default class TokenBucket {
   constructor(capacity, refillAmount, refillTime) {
-    this.capacity = capacity;      // Maximum tokens the bucket can hold
-    this.refillTime = refillTime;  // Refill interval in seconds
-    this.refillAmount = refillAmount; // Tokens to add per interval
-    this.redis = new Redis();      // Initialize Redis connection
-  }
+    this.capacity = capacity;
+    this.refillAmount = refillAmount;
+    this.refillTime = refillTime;
+    this.redis = new Redis();
 
-  async refillBucket(key) {
-    // Retrieve current token data from Redis
-    const data = await this.redis.get(key);
-    const currentTime = Date.now();
+    // Lua script for token consumption and refill
+    this.luaScript = `
+      local bucket_key = KEYS[1]
+      local capacity = tonumber(ARGV[1])
+      local refill_amount = tonumber(ARGV[2])
+      local refill_time = tonumber(ARGV[3])
+      local current_time = tonumber(ARGV[4])
 
-    let tokens = this.capacity;
-    let ts = currentTime;
+      -- Fetch existing bucket
+      local bucket = redis.call("GET", bucket_key)
+      local tokens = capacity
+      local last_ts = current_time
 
-    if (data) {
-      const bucket = JSON.parse(data);
-      tokens = bucket.tokens;
-      ts = bucket.ts;
+      if bucket then
+        bucket = cjson.decode(bucket)
+        tokens = tonumber(bucket.tokens)
+        last_ts = tonumber(bucket.ts)
 
-      // Calculate elapsed time in intervals
-      const elapsedTime = Math.floor((currentTime - ts) / (this.refillTime * 1000));
-      const newTokens = elapsedTime * this.refillAmount;
+        -- Calculate elapsed time and tokens to refill
+        local elapsed_time = math.floor((current_time - last_ts) / refill_time)
+        tokens = math.min(capacity, tokens + elapsed_time * refill_amount)
+      end
 
-      // Update token count and timestamp
-      tokens = Math.min(this.capacity, tokens + newTokens);
-      ts = currentTime;
-    }
-
-    // Save the updated bucket data to Redis
-    await this.redis.set(
-      key,
-      JSON.stringify({ tokens, ts })
-    );
-
-    return { tokens, ts };
-  }
-
-  async createBucket(key) {
-    const data = await this.redis.get(key);
-    if (!data) {
-      // Initialize a new bucket with full capacity if none exists
-      await this.redis.set(
-        key,
-        JSON.stringify({
-          tokens: this.capacity,
-          ts: Date.now(),
-        })
-      );
-    }
-    // Return the bucket data
-    return JSON.parse(await this.redis.get(key));
+      if tokens > 0 then
+        tokens = tokens - 1
+        redis.call("SET", bucket_key, cjson.encode({tokens=tokens, ts=current_time}))
+        return {tokens, capacity, 0}
+      else
+        local retry_after = refill_time - math.floor((current_time - last_ts) / 1000)
+        return {tokens, capacity, retry_after}
+      end
+    `;
   }
 
   async handleRequest(key) {
-    let bucket = await this.createBucket(key);
     const currentTime = Date.now();
+    const [tokens, capacity, retryAfter] = await this.redis.eval(
+      this.luaScript,
+      1,
+      key,
+      this.capacity,
+      this.refillAmount,
+      this.refillTime * 1000,
+      currentTime
+    );
 
-    // Calculate time elapsed since the last update
-    const elapsedTime = Math.floor((currentTime - bucket.ts) / 1000);
-
-    // Refill bucket if enough time has passed
-    if (elapsedTime >= this.refillTime) {
-      bucket = await this.refillBucket(key);
-    }
-
-    // Process request
-    if (bucket.tokens > 0) {
-      console.log(
-        chalk.green(
-          `Request[ACCEPTED] for ${key} (tokens - ${bucket.tokens}) -- ${new Date().toLocaleTimeString()}`
-        )
-      );
-      bucket.tokens -= 1;  // Deduct a token for the request
-
-      // Save updated token count to Redis
-      await this.redis.set(
-        key,
-        JSON.stringify({
-          tokens: bucket.tokens,
-          ts: bucket.ts
-        })
-      );
-      return true;
-    } else {
-      console.log(
-        chalk.red(
-          `Request[REJECTED] for ${key} (tokens - ${bucket.tokens}) -- ${new Date().toLocaleTimeString()}`
-        )
-      );
-      return false;
-    }
+    return { tokens, capacity, retryAfter };
   }
 }
